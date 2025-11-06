@@ -8,6 +8,8 @@ using Serilog;
 using ControlPanelSpace;
 using APIManagerSpace;
 
+//===   OK so this file is responsible for managing the sql database of market data
+
 namespace DatabaseManagerSpace{
     public static class DataBaseManager{
         //===The path to the SQLite file
