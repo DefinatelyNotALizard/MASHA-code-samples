@@ -8,8 +8,6 @@ using Serilog;
 using ControlPanelSpace;
 using APIManagerSpace;
 
-//===   OK so this file is responsible for managing the sql database of market data
-
 namespace DatabaseManagerSpace{
     public static class DataBaseManager{
         //===The path to the SQLite file
@@ -161,40 +159,161 @@ namespace DatabaseManagerSpace{
         //===Fills the gaps in the database for a given symbol
         public static async Task UpdateSymbolDataset(string symbol){
             Log.Information($"Updating {symbol}");
+
+            var gapWatch = System.Diagnostics.Stopwatch.StartNew();
             //===Get the gaps for that symbol
             List<(DateTime start, DateTime end)> gapsInData = GapFinder(symbol);
 
-            //===Create list to store retrieved data
-            List<(string timestamp, decimal open, decimal high, decimal low, decimal close, long volume, double average, int total)> fullData = new List<(string, decimal open, decimal, decimal, decimal, long, double, int)>();
+            gapWatch.Stop();
+            Log.Information($"Found {gapsInData.Count} gaps in {gapWatch.Elapsed}");
 
-            //===Loop through the gaps
+            //===Create list to store retrieved data
+            List<(string timestamp, decimal open, decimal high, decimal low, decimal close, long volume, double average, int total)> fullData 
+                = new List<(string, decimal, decimal, decimal, decimal, long, double, int)>();
+
+            var fetchWatch = System.Diagnostics.Stopwatch.StartNew();
+
+            //===Fetch all missing data first
             foreach((DateTime start, DateTime end) gap in gapsInData){
-                Log.Information($"{gap.start.ToString()} to {gap.end.ToString()}");
-                //===Get data for that gap, put into main list
-                foreach((string, decimal, decimal, decimal, decimal, long, double, int) dataPoint in await LaunchDataCall(symbol, gap.start, gap.end, "1Min")){
-                    fullData.Add(dataPoint);
+                Log.Information($"{gap.start} to {gap.end}");
+                var bars = await LaunchDataCall(symbol, gap.start, gap.end, "1Min");
+                fullData.AddRange(bars);
+            }
+
+            fetchWatch.Stop();
+
+            Log.Information($"Fetched {fullData.Count} bars for {symbol} in {fetchWatch.Elapsed}, now inserting into DB");
+
+            var InsertWatch = System.Diagnostics.Stopwatch.StartNew();
+            //===Insert all data into DB in one pass
+            using var connection = new SqliteConnection($"Data Source={dataBaseFile};");
+            connection.Open();
+
+            using var transaction = connection.BeginTransaction();
+            using var command = connection.CreateCommand();
+
+            foreach(var dataPoint in fullData){
+                // Use INSERT OR IGNORE to prevent UNIQUE constraint errors
+                command.CommandText = @$"
+                    INSERT OR IGNORE INTO historical_prices VALUES
+                    ('{dataPoint.timestamp}',
+                    '{symbol}',
+                    {dataPoint.open.ToString(CultureInfo.InvariantCulture)},
+                    {dataPoint.high.ToString(CultureInfo.InvariantCulture)},
+                    {dataPoint.low.ToString(CultureInfo.InvariantCulture)},
+                    {dataPoint.close.ToString(CultureInfo.InvariantCulture)},
+                    {dataPoint.volume},
+                    {dataPoint.average.ToString(CultureInfo.InvariantCulture)},
+                    {dataPoint.total});";
+                command.ExecuteNonQuery();
+            }
+
+            transaction.Commit();
+            InsertWatch.Stop();
+            Log.Information($"Inserted data for {symbol} successfully in {InsertWatch.Elapsed}");
+        }
+
+        //===WARNING, THE FOLLOWING METHOD POLLUTES THE DATA IF MISUSED, USE ONLY AFTER UpdateSymbolDataset
+        //===Artificially fill unfillable gaps (nothing was traded in those periods)
+        public static void ArtificialFill(string symbol){
+            Log.Information($"[ArtificialFill] Starting artificial gap fill for {symbol}");
+
+            //===Get the gaps for that symbol
+            List<(DateTime start, DateTime end)> gaps = GapFinder(symbol);
+
+            //===Open SQLite connection
+            using var connection = new SqliteConnection($"Data Source={dataBaseFile};");
+            connection.Open();
+            using var transaction = connection.BeginTransaction();
+            using var insert = connection.CreateCommand();
+
+            //===For each gap
+            foreach ((DateTime start, DateTime end) gap in gaps){
+                Log.Information($"[ArtificialFill] artificial-filling gap: {gap.start} -> {gap.end}");
+
+                //===Get the edges of the gap
+                var before = GetNearestBar(symbol, gap.start.AddMinutes(-1), connection);
+                var after  = GetNearestBar(symbol, gap.end, connection);
+
+                //===Make sure there ARE edges, not an open end
+                if (before is null || after is null)
+                    continue; // cannot interpolate
+
+                //===Current timestamp (used to loop through the minutes in a gap)
+                DateTime currentTime = gap.start;
+
+                //===Size of the gap
+                int totalMinutes = (int)(gap.end - gap.start).TotalMinutes;
+
+                //===Cook up a fake bar and put it into the DB
+                for (int i = 0; i < totalMinutes; i++){
+                    double t = (double)i / totalMinutes;
+
+                    decimal linOpen = before.Value.open + (decimal)t * (after.Value.open - before.Value.open);
+                    decimal linHigh = before.Value.high + (decimal)t * (after.Value.high - before.Value.high);
+                    decimal linLow  = before.Value.low  + (decimal)t * (after.Value.low  - before.Value.low);
+                    decimal linClose = before.Value.close + (decimal)t * (after.Value.close - before.Value.close);
+                    long volume      = 0;  // synthetic bar, no real volume
+                    double avg       = (double)(linOpen + linClose) / 2;
+                    int total        = 0;
+
+                    insert.CommandText = @$"
+                        INSERT OR IGNORE INTO historical_prices
+                        VALUES ('{currentTime:yyyy-MM-dd HH:mm}', '{symbol}',
+                                {linOpen.ToString(CultureInfo.InvariantCulture)},
+                                {linHigh.ToString(CultureInfo.InvariantCulture)},
+                                {linLow.ToString(CultureInfo.InvariantCulture)},
+                                {linClose.ToString(CultureInfo.InvariantCulture)},
+                                {volume},
+                                {avg.ToString(CultureInfo.InvariantCulture)},
+                                {total});
+                    ";
+                    insert.ExecuteNonQuery();
+
+                    currentTime = currentTime.AddMinutes(1);
                 }
             }
 
-            //Now we have all the missing data, we can add it to the DB
-            foreach((string t, decimal o, decimal h, decimal l, decimal c, long v, double vw, int n) dataPoint in fullData){
-                //===Create the command
-                string insertCommand = @$"
-                    INSERT INTO historical_prices VALUES
-                    ('{dataPoint.t}',
-                     '{symbol}',
-                     {dataPoint.o.ToString(CultureInfo.InvariantCulture)},
-                     {dataPoint.h.ToString(CultureInfo.InvariantCulture)},
-                     {dataPoint.l.ToString(CultureInfo.InvariantCulture)},
-                     {dataPoint.c.ToString(CultureInfo.InvariantCulture)},
-                     {dataPoint.v},
-                     {dataPoint.vw.ToString(CultureInfo.InvariantCulture)},
-                     {dataPoint.n})";//VOLKSWAGEN: DAS AUTO
-                //Culture info etc verifies that my decimals use a full stop and not a comma
-                //===Run the command
-                ExecuteCommand(insertCommand);
-            }
+            //===Close connection
+            transaction.Commit();
+            Log.Information($"[ArtificialFill] Completed artificial fill for {symbol}");
         }
+
+
+
+        //===Returns nearest bar BEFORE or ON the given timestamp
+        public static (string timestamp, decimal open, decimal high, decimal low, decimal close, long volume, double average, int total)? GetNearestBar(string symbol, DateTime timestamp, SqliteConnection conn){
+
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @$"
+                SELECT timestamp, open, high, low, close, volume, average, total
+                FROM historical_prices
+                WHERE symbol = @symbol AND timestamp <= @ts
+                ORDER BY timestamp DESC
+                LIMIT 1;
+            ";
+
+            cmd.Parameters.AddWithValue("@symbol", symbol);
+            cmd.Parameters.AddWithValue("@ts", timestamp.ToString("yyyy-MM-dd HH:mm"));
+
+            using var reader = cmd.ExecuteReader();
+
+            if (!reader.Read())
+                return null;
+
+            return (
+                reader.GetString(0),
+                reader.GetDecimal(1),
+                reader.GetDecimal(2),
+                reader.GetDecimal(3),
+                reader.GetDecimal(4),
+                reader.GetInt64(5),
+                reader.GetDouble(6),
+                reader.GetInt32(7)
+            );
+        }
+
+
 
         //Launches data call to APIManager
         private static async Task<List<(string timestamp, decimal open, decimal high, decimal low, decimal close, long volume, double average, int total)>> LaunchDataCall(string symbol, DateTime start, DateTime end, string interval){
@@ -267,17 +386,18 @@ namespace DatabaseManagerSpace{
                 string timeStampString = examinedTime.ToString("yyyy-MM-dd HH:mm");
 
                 //===Check if that timestamp exists in the database
-                if(exisitngTimeStamps.Contains(timeStampString)){
+                if(!exisitngTimeStamps.Contains(timeStampString)){
                     //===Close gap if open
-                    if(currentGapStart != null){
+                    if(currentGapStart == null){
                         //===Create gap tuple, and add to list, then nuke gapStart
+                        //gapRanges.Add(((DateTime)currentGapStart, examinedTime));
+                        currentGapStart = examinedTime;
+                    }
+                }else{
+                    //===Open gap if none is registered
+                    if(currentGapStart != null){
                         gapRanges.Add(((DateTime)currentGapStart, examinedTime));
                         currentGapStart = null;
-                    }else{
-                        //===Open gap if none is registered
-                        if(currentGapStart == null){
-                            currentGapStart = examinedTime;
-                        }
                     }
                 }
 
@@ -305,108 +425,56 @@ namespace DatabaseManagerSpace{
             return trimmedGaps;
         } 
 
-        //===Takes a gap as tuple and returns a list of market uptimes within
-        private static List<(DateTime start, DateTime end)> TrimMarketDowntime(DateTime givenStart, DateTime givenEnd){
-            //===These store the uptime periods
-            List<DateTime> startTimes = new List<DateTime>();
-            List<DateTime> endTimes = new List<DateTime>();
+        //===Trims a given time range to actual market hours, skipping holidays and half-days
+        private static List<(DateTime start, DateTime end)> TrimMarketDowntime(DateTime gapStart, DateTime gapEnd){
+            List<(DateTime start, DateTime end)> trimmedGaps = new();
 
-            //===Create a DateTime for market hours to compare against
-            DateTime marketOpen = new DateTime(givenStart.Year, givenStart.Month, givenStart.Day, 16, 30, 0);
-            DateTime marketClose = new DateTime(givenStart.Year, givenStart.Month, givenStart.Day, 23, 0, 0);
+            // Loop through each day in the range
+            for (DateTime day = gapStart.Date; day <= gapEnd.Date; day = day.AddDays(1)){
+                // Skip weekends and full holidays
+                if (IsMarketHoliday(day) || IsWeekend(day))
+                    continue;
 
-            //===Set start time
-            if(givenStart <= marketOpen){//before regular hours
-                startTimes.Add(marketOpen);
-            }else if(givenStart > marketOpen && givenStart < marketClose){//during regular hours
-                startTimes.Add(givenStart);
-            }else if(givenStart >= marketClose){//After regular hours
-                startTimes.Add(marketOpen.AddDays(1));
+                // Determine market open/close for this day
+                DateTime marketOpen = new DateTime(day.Year, day.Month, day.Day, 15, 30, 0); // 15:30 CEST
+                DateTime marketClose = IsHalfDay(day)
+                    ? new DateTime(day.Year, day.Month, day.Day, 20, 0, 0)  // Half-day close
+                    : new DateTime(day.Year, day.Month, day.Day, 22, 0, 0); // Normal close
+
+
+                // Calculate the overlap with the requested gap
+                DateTime start = gapStart > marketOpen ? gapStart : marketOpen;
+                DateTime end = gapEnd < marketClose ? gapEnd : marketClose;
+
+                if (start < end) // Only add valid intervals
+                    trimmedGaps.Add((start, end));
             }
 
-            //===Is examinedTime an opening time?
-            bool isOpening = false;
-
-            //===The opening time of the same day as the start time
-            DateTime jumpingOffTime = new DateTime(startTimes[0].Year, startTimes[0].Month, startTimes[0].Day, 16, 30, 0);
-
-            //===The time we are currently examining (we start with a closing time)
-            DateTime examinedTime = jumpingOffTime.AddHours(6).AddMinutes(30);
-
-            //===Loop through the market edge hours adding them if before givenEnd
-            while (examinedTime < givenEnd){
-                if(isOpening){
-                    startTimes.Add(examinedTime);
-                    examinedTime = examinedTime.AddHours(6).AddMinutes(30);
-                }else{
-                    endTimes.Add(examinedTime);
-                    examinedTime = examinedTime.AddHours(17).AddMinutes(30);
-                }
-                isOpening = !isOpening;
-            }
-
-            //===Add givenEnd if inside market edge hours
-            if(!isOpening){//the examined time just after givenEnd is a closing time therefore givenEnd is between market edge hours
-                endTimes.Add(givenEnd);
-            }
-
-            //===List of gaps to return
-            List<(DateTime start, DateTime end)> gapsToReturn = new List<(DateTime, DateTime)>();
-
-            //===Pack the start and end times into tuples while eliminating holidays
-            for(int i = 0; i < startTimes.Count; i++){
-                if(!IsMarketHoliday(startTimes[i])){//that day is not a full holiday
-                    if(!IsHalfDay(startTimes[i])){//that day is not a half holiday
-                        gapsToReturn.Add((startTimes[i], endTimes[i]));
-                    }else{//It's a half day
-                        DateTime endOfHalfDay = new DateTime(startTimes[i].Year, startTimes[i].Month, startTimes[i].Day, 20, 0, 0);
-                        if(startTimes[i] < endOfHalfDay){
-                            if(endTimes[i] < endOfHalfDay){
-                                gapsToReturn.Add((startTimes[i], endTimes[i]));//The gap fits half day
-                            }
-                            gapsToReturn.Add((startTimes[i], endOfHalfDay));//The gap doesn't fit half day
-                        }
-                    }
-                }
-            }                  
-            return gapsToReturn;
+            return trimmedGaps;
         }
 
-        //===Tells you if the inputted day is a market holiday
-        private static bool IsMarketHoliday(DateTime thisDay){
-            //===Chop off the time bc it's irrelevant
-            DateOnly date = DateOnly.FromDateTime(thisDay);
+        //===Returns true if the day is a full holiday
+        private static bool IsMarketHoliday(DateTime day){
+            int year = day.Year;
+            DateOnly date = DateOnly.FromDateTime(day);
 
-            //===Test the date through each holiday
-            List<bool> holidayTest = new List<bool>();
-            holidayTest.Add(IsNewYearsDay(date));
-            holidayTest.Add(IsMLKDay(date));
-            holidayTest.Add(IsPresidentsDay(date));
-            holidayTest.Add(IsGoodFriday(date));
-            holidayTest.Add(IsMemorialDay(date));
-            holidayTest.Add(IsJuneNineteenth(date));
-            holidayTest.Add(IsIndependenceDay(date));
-            holidayTest.Add(IsLabourDay(date));
-            holidayTest.Add(IsThanksgiving(date));
-            holidayTest.Add(IsChristmasDay(date));
-            holidayTest.Add(IsWeekend(date));
-
-            return holidayTest.Contains(true);
+            return IsNewYearsDay(date) || IsMLKDay(date) || IsPresidentsDay(date) ||
+           IsGoodFriday(date) || IsMemorialDay(date) || IsJuneNineteenth(date) ||
+           IsIndependenceDay(date) || IsLabourDay(date) || IsThanksgiving(date) ||
+           IsChristmasDay(date);
         }
 
-        //===Tells you if it's a half day (ends at 7pm CEST)
-        private static bool IsHalfDay(DateTime thisDay){
-            //===Chop off the time bc it's irrelevant
-            DateOnly date = DateOnly.FromDateTime(thisDay);
-
-            //===Test the date through each half day
-            List<bool> halfDayTest = new List<bool>();
-            halfDayTest.Add(IsIndependenceDayEve(date));
-            halfDayTest.Add(IsBlackFriday(date));
-            halfDayTest.Add(IsChristmasEve(date));
-
-            return halfDayTest.Contains(true);
+        //===Returns true if it’s a half day
+        private static bool IsHalfDay(DateTime day){
+            DateOnly date = DateOnly.FromDateTime(day);
+            return IsIndependenceDayEve(date) || IsBlackFriday(date) || IsChristmasEve(date);
         }
+
+        //===Returns true if the day is a weekend
+        private static bool IsWeekend(DateTime day){
+            return day.DayOfWeek == DayOfWeek.Saturday || day.DayOfWeek == DayOfWeek.Sunday;
+        }
+
 
         //===These are used by MarketHoliday
         //===
@@ -463,12 +531,7 @@ namespace DatabaseManagerSpace{
         }
 
         private static bool IsChristmasDay(DateOnly day){
-            //CHRIST IS KING + + + + + + +
             return day == new DateOnly(day.Year, 12, 25);
-        }
-
-        private static bool IsWeekend(DateOnly day){
-            return day.DayOfWeek == DayOfWeek.Saturday || day.DayOfWeek == DayOfWeek.Sunday;
         }
         //===
 
@@ -514,5 +577,22 @@ namespace DatabaseManagerSpace{
             return new DateOnly(year, month, dayOfMonth);
         }
 
+        
+
+        
+
+        /*New Year’s Day (Jan 1) --static
+MLK Day (Jan 20) --dynamic
+Presidents’ Day (Feb 17) --dynamic
+Good Friday (Apr 18) --dynamic
+Memorial Day (May 26) --dynamic
+Juneteenth (Jun 19) --static
+Independence Day (Jul 4) --static
+Day Before Independence Day (Jul 3) --half //FIX THIS
+Labor Day (Sep 1) --dynamic
+Thanksgiving Day (Nov 27) --dynamic
+Day Before Thanksgiving (Nov 26) --half //FIX THIS
+Christmas Eve (Dec 24) --half //FIX THIS
+Christmas Day (Dec 25) --static*/
     }
 }
