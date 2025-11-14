@@ -8,6 +8,8 @@ using Serilog;
 using ControlPanelSpace;
 using APIManagerSpace;
 
+//TODO: add a line to the DB that tells you if that entry is artificial
+
 namespace DatabaseManagerSpace{
     public static class DataBaseManager{
         //===The path to the SQLite file
@@ -46,7 +48,6 @@ namespace DatabaseManagerSpace{
 
         //===Allows execution of SQL queries by any class
         public static object ExecuteCommand(string query){
-            Log.Information($"SQLite Command Execution {query}");
             //===Connect to the DB
             using var connection = new SqliteConnection($"Data Source={dataBaseFile};");
             connection.Open();
@@ -158,8 +159,6 @@ namespace DatabaseManagerSpace{
 
         //===Fills the gaps in the database for a given symbol
         public static async Task UpdateSymbolDataset(string symbol){
-            Log.Information($"Updating {symbol}");
-
             var gapWatch = System.Diagnostics.Stopwatch.StartNew();
             //===Get the gaps for that symbol
             List<(DateTime start, DateTime end)> gapsInData = GapFinder(symbol);
@@ -317,7 +316,6 @@ namespace DatabaseManagerSpace{
 
         //Launches data call to APIManager
         private static async Task<List<(string timestamp, decimal open, decimal high, decimal low, decimal close, long volume, double average, int total)>> LaunchDataCall(string symbol, DateTime start, DateTime end, string interval){
-            Log.Information($"Calling for {symbol} from {start.ToString()} to {end.ToString()}");
             //Convert times to UTC
             DateTime utcStart = ControlPanel.CESTtoUTC(start);
             DateTime utcEnd = ControlPanel.CESTtoUTC(end);
@@ -350,7 +348,6 @@ namespace DatabaseManagerSpace{
 
         //===Finds gaps in the DB for a given symbol
         public static List<(DateTime start, DateTime end)> GapFinder(string symbol){
-            Log.Information($"Finding gaps for {symbol}");
             //===Get the Ultimate Start Date from the control panel as a string and convert to DateTime
             var rawStartDate = ControlPanel.GetSetting("DataStart");
             DateTime ultimateStartDate = DateTime.ParseExact((string)rawStartDate, "yyyy-MM-dd HH:mm", null);
@@ -454,18 +451,18 @@ namespace DatabaseManagerSpace{
         }
 
         //===Returns true if the day is a full holiday
-        private static bool IsMarketHoliday(DateTime day){
+        public static bool IsMarketHoliday(DateTime day){
             int year = day.Year;
             DateOnly date = DateOnly.FromDateTime(day);
 
             return IsNewYearsDay(date) || IsMLKDay(date) || IsPresidentsDay(date) ||
            IsGoodFriday(date) || IsMemorialDay(date) || IsJuneNineteenth(date) ||
            IsIndependenceDay(date) || IsLabourDay(date) || IsThanksgiving(date) ||
-           IsChristmasDay(date);
+           IsChristmasDay(date) || IsWeekend(day);
         }
 
         //===Returns true if it’s a half day
-        private static bool IsHalfDay(DateTime day){
+        public static bool IsHalfDay(DateTime day){
             DateOnly date = DateOnly.FromDateTime(day);
             return IsIndependenceDayEve(date) || IsBlackFriday(date) || IsChristmasEve(date);
         }
@@ -577,22 +574,5 @@ namespace DatabaseManagerSpace{
             return new DateOnly(year, month, dayOfMonth);
         }
 
-        
-
-        
-
-        /*New Year’s Day (Jan 1) --static
-MLK Day (Jan 20) --dynamic
-Presidents’ Day (Feb 17) --dynamic
-Good Friday (Apr 18) --dynamic
-Memorial Day (May 26) --dynamic
-Juneteenth (Jun 19) --static
-Independence Day (Jul 4) --static
-Day Before Independence Day (Jul 3) --half //FIX THIS
-Labor Day (Sep 1) --dynamic
-Thanksgiving Day (Nov 27) --dynamic
-Day Before Thanksgiving (Nov 26) --half //FIX THIS
-Christmas Eve (Dec 24) --half //FIX THIS
-Christmas Day (Dec 25) --static*/
     }
 }
